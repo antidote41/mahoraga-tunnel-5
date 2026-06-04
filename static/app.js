@@ -1,5 +1,11 @@
 /* =============================================
-   Mahoraga Dashboard — Frontend Logic
+   Mahoraga Dashboard — Frontend Logic (v4-autonomous)
+   =============================================
+   The dashboard is a pure view into the server's state.
+   Closing and reopening the browser fully restores everything.
+
+   PERFORMANCE: All DOM updates are throttled and batched to
+   prevent browser freezing/crashing during high-throughput jobs.
    ============================================= */
 let proxyMode = 'none'; // none | list | api | single
 const API = {
@@ -9,12 +15,24 @@ const API = {
   resume: '/api/resume',
   stop: '/api/stop',
   status: '/api/status',
+  fullState: '/api/full_state',
   export: '/api/export',
 };
+
+// ---------- Constants ----------
+const MAX_DOM_RESULT_ROWS = 10;   // Max result rows in the DOM at any time
+const MAX_DOM_LOG_LINES = 50;     // Max log lines in the DOM at any time
+const UI_THROTTLE_MS = 250;       // Min ms between UI updates from WebSocket
 
 // ---------- State ----------
 let jobState = 'idle'; // idle | running | paused | completed | stopped
 let allDomains = [];
+let domainsLoaded = false; // flag to track when domains are rendered
+
+// ---------- Throttle State ----------
+let _pendingUpdate = null;        // Queued status_update data
+let _updateScheduled = false;     // Whether a rAF is pending
+let _lastUpdateTime = 0;          // Timestamp of last applied update
 
 // ---------- Socket.IO ----------
 const socket = io();
@@ -61,7 +79,6 @@ document.addEventListener('DOMContentLoaded', () => {
   loadDomains();
   updateButtonStates();
   initProxyTabs();
-  syncInitialStatus();
 });
 
 // ---------- Init ----------
@@ -105,12 +122,10 @@ function updateEmailCount() {
 function initProxyTabs() {
   $$('.proxy-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      // Remove active from all tabs
       $$('.proxy-tab').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       proxyMode = tab.dataset.mode;
 
-      // Show/hide panels
       $$('.proxy-panel').forEach(p => p.style.display = 'none');
       if (proxyMode !== 'none') {
         const panel = $(`#proxy-panel-${proxyMode}`);
@@ -137,6 +152,40 @@ function getProxyConfig() {
   return { mode: 'none' };
 }
 
+/**
+ * Restore proxy config UI from server state.
+ */
+function restoreProxyConfig(proxyConfig) {
+  if (!proxyConfig) return;
+  const mode = proxyConfig.mode || 'none';
+  proxyMode = mode;
+
+  $$('.proxy-tab').forEach(t => t.classList.remove('active'));
+  const tab = $(`#proxy-tab-${mode}`);
+  if (tab) tab.classList.add('active');
+
+  $$('.proxy-panel').forEach(p => p.style.display = 'none');
+  if (mode !== 'none') {
+    const panel = $(`#proxy-panel-${mode}`);
+    if (panel) panel.style.display = 'block';
+  }
+
+  if (mode === 'list' && proxyConfig.proxies) {
+    const input = $('#proxy-list-input');
+    if (input) {
+      input.value = proxyConfig.proxies.join('\n');
+      const count = proxyConfig.proxies.length;
+      $('#proxy-count').textContent = `${count} prox${count !== 1 ? 'ies' : 'y'}`;
+    }
+  } else if (mode === 'api' && proxyConfig.api_url) {
+    const input = $('#proxy-api-input');
+    if (input) input.value = proxyConfig.api_url;
+  } else if (mode === 'single' && proxyConfig.proxy) {
+    const input = $('#proxy-single-input');
+    if (input) input.value = proxyConfig.proxy;
+  }
+}
+
 // ---------- Domains ----------
 async function loadDomains() {
   try {
@@ -144,6 +193,7 @@ async function loadDomains() {
     const data = await res.json();
     allDomains = data.domains;
     renderDomains(data.grouped);
+    domainsLoaded = true;
   } catch (e) {
     addLog('error', `Failed to load domains: ${e.message}`);
   }
@@ -191,7 +241,6 @@ function filterDomains() {
     const match = !q || name.includes(q) || domain.includes(q);
     item.classList.toggle('hidden', !match);
   });
-  // Also hide categories with no visible children
   $$('.domain-category').forEach(cat => {
     let next = cat.nextElementSibling;
     let hasVisible = false;
@@ -217,6 +266,17 @@ function getSelectedDomains() {
   return selected;
 }
 
+/**
+ * Restore domain selections from a list of domain names.
+ */
+function restoreDomainSelections(selectedDomains) {
+  if (!selectedDomains || selectedDomains.length === 0) return;
+  const selectedSet = new Set(selectedDomains);
+  $$('.domain-item input[type="checkbox"]').forEach(cb => {
+    cb.checked = selectedSet.has(cb.value);
+  });
+}
+
 // ---------- Job Control ----------
 async function startJob() {
   const emailText = els.emailInput.value.trim();
@@ -236,7 +296,6 @@ async function startJob() {
   const proxyConfig = getProxyConfig();
   const rentryCustomId = els.rentryCustomId ? els.rentryCustomId.value.trim() : '';
 
-  // Validate proxy config
   if (proxyConfig.mode === 'list' && (!proxyConfig.proxies || proxyConfig.proxies.length === 0)) {
     addLog('error', 'Proxy List mode selected but no proxies provided.');
     return;
@@ -252,18 +311,22 @@ async function startJob() {
 
   try {
     console.log("[DEBUG] Sending POST to /api/start...");
-    console.log("[DEBUG] Payload:", { emails: emails.length, domains: domains.length, threadSize, proxyConfig, rentryCustomId });
     const res = await fetch(API.start, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ emails, domains, thread_size: threadSize, proxy: proxyConfig, rentry_custom_id: rentryCustomId }),
+      body: JSON.stringify({
+        emails,
+        domains,
+        thread_size: threadSize,
+        proxy: proxyConfig,
+        rentry_custom_id: rentryCustomId,
+        email_text: emailText,
+      }),
     });
-    console.log(`[DEBUG] /api/start response status: ${res.status} ${res.statusText}`);
-    
-    // Read raw text first so we can see what the server actually sent
+
     const rawText = await res.text();
-    console.log(`[DEBUG] /api/start response body:`, rawText);
-    
+    console.log(`[DEBUG] /api/start response: ${res.status}`, rawText);
+
     let data;
     try {
       data = JSON.parse(rawText);
@@ -271,12 +334,11 @@ async function startJob() {
       addLog('error', `Server returned invalid JSON: ${rawText}`);
       return;
     }
-    
+
     if (data.error) {
       addLog('error', data.error);
       return;
     }
-    // Reset UI
     resetMonitoring();
     setJobState('running');
     addLog('info', `Job started — ${emails.length} emails × ${domains.length} domains, batch size ${threadSize}`);
@@ -315,53 +377,164 @@ async function stopJob() {
   }
 }
 
-// ---------- Sync Initial Status ----------
-async function syncInitialStatus() {
-  try {
-    const res = await fetch(`${API.status}?log_offset=0&result_offset=0`);
-    const data = await res.json();
-    
-    setJobState(data.state);
-    updateProgress(data.progress);
-    updateStats(data.stats);
-    updateRates(data.rates);
-    
-    if (data.new_results && data.new_results.length > 0) {
-      appendResults(data.new_results);
-    }
-    
-    if (data.new_logs && data.new_logs.length > 0) {
-      data.new_logs.forEach(log => addLogLine(log.level, log.message, log.time));
-    }
-    
-    addLog('info', `Synced state from server: ${data.state}`);
-  } catch (e) {
-    addLog('error', `Failed to sync status from server: ${e.message}`);
-  }
-}
+// ============================================================
+//  FULL STATE RESTORE — the "never closed" feature
+// ============================================================
 
-// ---------- WebSocket Listener ----------
-socket.on('status_update', (data) => {
-  // Update progress
+/**
+ * Called when the server sends 'full_state' on connect/reconnect.
+ * Restores the entire dashboard: config, progress, stats, logs, results.
+ */
+function handleFullState(data) {
+  console.log('[RESTORE] Received full state from server:', data.state);
+
+  // 1. Restore job state
+  setJobState(data.state);
+
+  // 2. Restore progress
   updateProgress(data.progress);
 
-  // Update stats
-  updateStats(data.stats);
+  // 3. Restore stats
+  updateStatsImmediate(data.stats);
 
-  // Update rates
-  updateRates(data.rates);
+  // 4. Restore rates
+  updateRatesImmediate(data.rates);
 
-  // Append new results
+  // 5. Restore config (emails, domains, settings)
+  if (data.config) {
+    if (data.config.email_text) {
+      els.emailInput.value = data.config.email_text;
+      updateEmailCount();
+    }
+    if (data.config.thread_size) {
+      els.threadSize.value = data.config.thread_size;
+    }
+    if (data.config.rentry_custom_id && els.rentryCustomId) {
+      els.rentryCustomId.value = data.config.rentry_custom_id;
+    }
+    restoreProxyConfig(data.config.proxy);
+
+    // Restore domain selections (with retry if domains haven't loaded yet)
+    if (data.config.selected_domains && data.config.selected_domains.length > 0) {
+      if (domainsLoaded) {
+        restoreDomainSelections(data.config.selected_domains);
+      } else {
+        const retryRestore = () => {
+          if (domainsLoaded) {
+            restoreDomainSelections(data.config.selected_domains);
+          } else {
+            setTimeout(retryRestore, 200);
+          }
+        };
+        setTimeout(retryRestore, 200);
+      }
+    }
+  }
+
+  // 6. Restore results (pre-trimmed by server to last 200)
+  els.resultsBody.innerHTML = '';
+  if (data.all_results && data.all_results.length > 0) {
+    // Only render the last MAX_DOM_RESULT_ROWS to keep DOM light
+    const toRender = data.all_results.slice(-MAX_DOM_RESULT_ROWS);
+    appendResultsDirect(toRender);
+  }
+
+  // 7. Restore logs (pre-trimmed by server to last 200)
+  els.logConsole.innerHTML = '';
+  if (data.all_logs && data.all_logs.length > 0) {
+    // Only render the last MAX_DOM_LOG_LINES
+    const toRender = data.all_logs.slice(-MAX_DOM_LOG_LINES);
+    toRender.forEach(log => addLogLineDirect(log.level, log.message, log.time));
+  }
+
+  // 8. Update input disabled states
+  updateInputStates();
+
+  console.log('[RESTORE] Full state restore complete');
+}
+
+// Listen for full_state from server (on connect/reconnect)
+socket.on('full_state', (data) => {
+  handleFullState(data);
+});
+
+// ============================================================
+//  THROTTLED WEBSOCKET HANDLER
+//  Prevents rapid-fire DOM updates from causing browser freeze
+// ============================================================
+
+socket.on('status_update', (data) => {
+  // Merge new data into pending update (latest wins for stats/progress)
+  if (!_pendingUpdate) {
+    _pendingUpdate = {
+      state: data.state,
+      progress: data.progress,
+      stats: data.stats,
+      rates: data.rates,
+      new_logs: [],
+      new_results: [],
+    };
+  } else {
+    _pendingUpdate.state = data.state;
+    _pendingUpdate.progress = data.progress;
+    _pendingUpdate.stats = data.stats;
+    _pendingUpdate.rates = data.rates;
+  }
+
+  // Accumulate new results and logs
   if (data.new_results && data.new_results.length > 0) {
-    appendResults(data.new_results);
+    _pendingUpdate.new_results.push(...data.new_results);
   }
-
-  // Append new logs
   if (data.new_logs && data.new_logs.length > 0) {
-    data.new_logs.forEach(log => addLogLine(log.level, log.message, log.time));
+    _pendingUpdate.new_logs.push(...data.new_logs);
   }
 
-  // Check if job is done
+  // Schedule a batched DOM update via requestAnimationFrame
+  if (!_updateScheduled) {
+    _updateScheduled = true;
+    requestAnimationFrame(applyPendingUpdate);
+  }
+});
+
+/**
+ * Apply the accumulated pending update to the DOM.
+ * Uses requestAnimationFrame to batch with the browser's render cycle.
+ */
+function applyPendingUpdate() {
+  _updateScheduled = false;
+
+  const now = performance.now();
+  // Throttle: skip if called too soon (let the next rAF handle it)
+  if (now - _lastUpdateTime < UI_THROTTLE_MS && _pendingUpdate) {
+    _updateScheduled = true;
+    requestAnimationFrame(applyPendingUpdate);
+    return;
+  }
+  _lastUpdateTime = now;
+
+  const data = _pendingUpdate;
+  if (!data) return;
+  _pendingUpdate = null;
+
+  // Update simple numeric displays (cheap)
+  updateProgress(data.progress);
+  updateStatsImmediate(data.stats);
+  updateRatesImmediate(data.rates);
+
+  // Append new results (capped before DOM insertion)
+  if (data.new_results.length > 0) {
+    // Only render the latest MAX_DOM_RESULT_ROWS from the batch
+    const toRender = data.new_results.slice(-MAX_DOM_RESULT_ROWS);
+    appendResultsDirect(toRender);
+  }
+
+  // Append new logs (capped before DOM insertion)
+  if (data.new_logs.length > 0) {
+    const toRender = data.new_logs.slice(-MAX_DOM_LOG_LINES);
+    toRender.forEach(log => addLogLineDirect(log.level, log.message, log.time));
+  }
+
+  // State transitions
   if (data.state === 'completed') {
     if (jobState !== 'completed') {
       setJobState('completed');
@@ -374,12 +547,16 @@ socket.on('status_update', (data) => {
   } else if (data.state === 'running') {
     if (jobState !== 'running') setJobState('running');
   }
-});
+}
 
-// ---------- UI Updates ----------
+// ============================================================
+//  UI UPDATE FUNCTIONS (Performance-safe)
+// ============================================================
+
 function updateProgress(progress) {
   if (!progress) return;
-  const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+  const rawPct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+  const pct = Math.min(rawPct, 100);  // NEVER exceed 100%
   els.progressBar.style.width = `${pct}%`;
   els.progressPercent.textContent = `${pct}%`;
   els.progressText.innerHTML = `<strong>${progress.done}</strong> / ${progress.total} emails processed`;
@@ -391,21 +568,22 @@ function updateProgress(progress) {
   }
 }
 
-function updateStats(stats) {
+/**
+ * Update stat counters without animation (for batched/throttled updates).
+ */
+function updateStatsImmediate(stats) {
   if (!stats) return;
-  animateCounter(els.statTotal, stats.total);
-  animateCounter(els.statSuccess, stats.exists);
-  animateCounter(els.statNotFound, stats.not_found);
-  animateCounter(els.statRateLimit, stats.rate_limit);
-  animateCounter(els.statErrors, stats.errors);
+  setCounter(els.statTotal, stats.total);
+  setCounter(els.statSuccess, stats.exists);
+  setCounter(els.statNotFound, stats.not_found);
+  setCounter(els.statRateLimit, stats.rate_limit);
+  setCounter(els.statErrors, stats.errors);
 }
 
-function animateCounter(el, target) {
+function setCounter(el, value) {
   const current = parseInt(el.textContent) || 0;
-  if (current !== target) {
-    el.textContent = target;
-    el.style.transform = 'scale(1.15)';
-    setTimeout(() => { el.style.transform = 'scale(1)'; }, 200);
+  if (current !== value) {
+    el.textContent = value;
   }
 }
 
@@ -416,29 +594,41 @@ function formatRate(value) {
   return value.toFixed(1);
 }
 
-function updateRates(rates) {
+/**
+ * Update rate counters without animation (for batched/throttled updates).
+ */
+function updateRatesImmediate(rates) {
   if (!rates) return;
-  animateRateCounter(els.ratePerMinute, rates.per_minute);
-  animateRateCounter(els.ratePerHour, rates.per_hour);
-  animateRateCounter(els.ratePerDay, rates.per_day);
-  animateRateCounter(els.ratePerWeek, rates.per_week);
+  setRateCounter(els.ratePerMinute, rates.per_minute);
+  setRateCounter(els.ratePerHour, rates.per_hour);
+  setRateCounter(els.ratePerDay, rates.per_day);
+  setRateCounter(els.ratePerWeek, rates.per_week);
 }
 
-function animateRateCounter(el, target) {
-  const formatted = formatRate(target);
+function setRateCounter(el, value) {
+  const formatted = formatRate(value);
   if (el.textContent !== formatted) {
     el.textContent = formatted;
-    el.style.transform = 'scale(1.15)';
-    setTimeout(() => { el.style.transform = 'scale(1)'; }, 200);
   }
 }
 
-function appendResults(results) {
+/**
+ * Append result rows to the DOM. Pre-trims input to MAX_DOM_RESULT_ROWS
+ * before creating any DOM nodes, preventing unnecessary node creation.
+ */
+function appendResultsDirect(results) {
+  if (!results || results.length === 0) return;
+
   if (els.resultsEmpty) {
     els.resultsEmpty.style.display = 'none';
   }
+
+  // Pre-trim: only create DOM nodes for what we'll actually keep
+  const maxNew = MAX_DOM_RESULT_ROWS;
+  const toCreate = results.length > maxNew ? results.slice(-maxNew) : results;
+
   const fragment = document.createDocumentFragment();
-  for (const r of results) {
+  for (const r of toCreate) {
     const tr = document.createElement('tr');
     tr.className = 'fade-in';
 
@@ -469,16 +659,39 @@ function appendResults(results) {
   }
   els.resultsBody.appendChild(fragment);
 
-  // Limit DOM rows to prevent browser crash
-  while (els.resultsBody.children.length > 10) {
-    els.resultsBody.removeChild(els.resultsBody.firstChild);
+  // Trim old rows from the top (single pass, no loop per-row)
+  const excess = els.resultsBody.children.length - MAX_DOM_RESULT_ROWS;
+  if (excess > 0) {
+    for (let i = 0; i < excess; i++) {
+      els.resultsBody.removeChild(els.resultsBody.firstChild);
+    }
   }
 
-  // Auto-scroll results to bottom
+  // Auto-scroll to bottom
   const wrapper = els.resultsBody.closest('.results-wrapper');
   if (wrapper) {
     wrapper.scrollTop = wrapper.scrollHeight;
   }
+}
+
+/**
+ * Add a log line to the console. Trims old lines to MAX_DOM_LOG_LINES.
+ */
+function addLogLineDirect(level, message, time) {
+  const line = document.createElement('div');
+  line.className = `log-line ${level}`;
+  line.innerHTML = `<span class="log-time">[${escapeHtml(time)}]</span>${escapeHtml(message)}`;
+  els.logConsole.appendChild(line);
+
+  // Trim old lines
+  const excess = els.logConsole.children.length - MAX_DOM_LOG_LINES;
+  if (excess > 0) {
+    for (let i = 0; i < excess; i++) {
+      els.logConsole.removeChild(els.logConsole.firstChild);
+    }
+  }
+
+  els.logConsole.scrollTop = els.logConsole.scrollHeight;
 }
 
 function resetMonitoring() {
@@ -503,6 +716,7 @@ function setJobState(state) {
   jobState = state;
   updateButtonStates();
   updateHeaderStatus();
+  updateInputStates();
 }
 
 function updateButtonStates() {
@@ -514,17 +728,56 @@ function updateButtonStates() {
   els.btnPause.disabled = !(isRunning || isPaused);
   els.btnStop.disabled = !(isRunning || isPaused);
 
-  // Update pause button label
   if (isPaused) {
     els.btnPause.innerHTML = '▶ Resume';
   } else {
     els.btnPause.innerHTML = '⏸ Pause';
   }
 
-  // Enable/disable export buttons based on whether there are results
   const hasResults = els.resultsBody.children.length > 0;
   $$('.btn-export').forEach(btn => {
     btn.disabled = !hasResults;
+  });
+}
+
+/**
+ * Disable/enable input controls based on job state.
+ */
+function updateInputStates() {
+  const isActive = jobState === 'running' || jobState === 'paused';
+
+  els.emailInput.disabled = isActive;
+  els.emailInput.style.opacity = isActive ? '0.6' : '1';
+
+  els.threadSize.disabled = isActive;
+  els.threadSize.style.opacity = isActive ? '0.6' : '1';
+
+  if (els.rentryCustomId) {
+    els.rentryCustomId.disabled = isActive;
+    els.rentryCustomId.style.opacity = isActive ? '0.6' : '1';
+  }
+
+  $$('.domain-item input[type="checkbox"]').forEach(cb => {
+    cb.disabled = isActive;
+  });
+
+  const btnSelectAll = $('#btn-select-all');
+  const btnDeselectAll = $('#btn-deselect-all');
+  if (btnSelectAll) btnSelectAll.disabled = isActive;
+  if (btnDeselectAll) btnDeselectAll.disabled = isActive;
+
+  $$('.proxy-tab').forEach(tab => {
+    tab.disabled = isActive;
+    tab.style.opacity = isActive ? '0.6' : '1';
+    tab.style.pointerEvents = isActive ? 'none' : '';
+  });
+
+  ['#proxy-list-input', '#proxy-api-input', '#proxy-single-input'].forEach(sel => {
+    const input = $(sel);
+    if (input) {
+      input.disabled = isActive;
+      input.style.opacity = isActive ? '0.6' : '1';
+    }
   });
 }
 
@@ -543,21 +796,7 @@ function updateHeaderStatus() {
 // ---------- Logging ----------
 function addLog(level, message) {
   const now = new Date().toLocaleTimeString('en-US', { hour12: false });
-  addLogLine(level, message, now);
-}
-
-function addLogLine(level, message, time) {
-  const line = document.createElement('div');
-  line.className = `log-line ${level}`;
-  line.innerHTML = `<span class="log-time">[${escapeHtml(time)}]</span>${escapeHtml(message)}`;
-  els.logConsole.appendChild(line);
-
-  // Limit log lines to prevent browser crash
-  while (els.logConsole.children.length > 50) {
-    els.logConsole.removeChild(els.logConsole.firstChild);
-  }
-
-  els.logConsole.scrollTop = els.logConsole.scrollHeight;
+  addLogLineDirect(level, message, now);
 }
 
 // ---------- Export ----------

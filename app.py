@@ -6,7 +6,7 @@ Binds to 0.0.0.0:5000 for external access.
 """
 
 # Version marker — used to verify the latest code is deployed
-APP_VERSION = "v3-debug"
+APP_VERSION = "v4-autonomous"
 
 import sys
 if hasattr(sys.stdout, 'reconfigure'):
@@ -201,6 +201,13 @@ class JobState:
         self._pause_event.set()  # not paused initially
         self._stop_flag = False
         self.worker_thread = None
+        # --- Persistent dashboard config (for full state restore) ---
+        self.email_text = ""                # raw pasted email text
+        self.selected_domain_names = []     # list of domain names selected
+        self.thread_size_setting = 5        # the batch size the user chose
+        self.job_start_time = None          # epoch when job started
+        self.job_end_time = None            # epoch when job ended
+        self._completed_emails = set()      # tracks which emails are done (prevents double-count)
 
     def add_log(self, level, message):
         with self.lock:
@@ -237,12 +244,19 @@ class JobState:
                 else:
                     self.stats["not_found"] += 1
 
-    def increment_done(self):
+    def increment_done(self, email):
+        """Mark an email as done. Guards against double-counting and exceeding total."""
         with self.lock:
-            self.done_emails += 1
+            if email in self._completed_emails:
+                dbg("PROGRESS", f"SKIPPED duplicate increment for: {email}")
+                return
+            self._completed_emails.add(email)
+            if self.done_emails < self.total_emails:
+                self.done_emails += 1
             done = self.done_emails
             total = self.total_emails
-        dbg("PROGRESS", f"Emails done: {done}/{total} ({done*100//total if total else 0}%)")
+        pct = min(done * 100 // total, 100) if total else 0
+        dbg("PROGRESS", f"Emails done: {done}/{total} ({pct}%)")
 
     def compute_rates(self):
         """Return checks per minute, hour, day, and week based on timestamps."""
@@ -491,8 +505,11 @@ def worker_thread():
 
             with job.lock:
                 job.state = "completed"
+                job.job_end_time = time.time()
             job.add_log("success", f"All emails processed in {total_elapsed:.1f}s!")
         else:
+            with job.lock:
+                job.job_end_time = time.time()
             job.add_log("warn", "Job was stopped.")
 
     except Exception as e:
@@ -503,6 +520,7 @@ def worker_thread():
         job.add_log("error", f"[FATAL TRACEBACK] {tb}")
         with job.lock:
             job.state = "completed"
+            job.job_end_time = time.time()
 
 
 async def async_job_runner(emails, modules, batch_size):
@@ -657,7 +675,7 @@ async def _process_email(email, modules, client):
 
     # Record results
     job.add_results(email, out)
-    job.increment_done()
+    job.increment_done(email)
 
     # Summary log for this email
     found = sum(1 for r in out if r.get("exists"))
@@ -680,21 +698,69 @@ async def _process_email(email, modules, client):
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
+
+@socketio.on('connect')
+def handle_connect():
+    """When a client connects/reconnects, push full state immediately.
+    Results and logs are capped to prevent browser crashes on large jobs.
+    """
+    dbg("SOCKET", "Client connected — sending full state")
+    MAX_RESULTS = 200
+    MAX_LOGS = 200
+    with job.lock:
+        # Only send the tail of results/logs to avoid crashing the browser
+        total_results = len(job.results)
+        total_logs = len(job.logs)
+        tail_results = job.results[-MAX_RESULTS:] if total_results > MAX_RESULTS else list(job.results)
+        tail_logs = job.logs[-MAX_LOGS:] if total_logs > MAX_LOGS else list(job.logs)
+        state_data = {
+            "state": job.state,
+            "progress": {
+                "done": min(job.done_emails, job.total_emails),
+                "total": job.total_emails,
+            },
+            "stats": dict(job.stats),
+            "rates": job.compute_rates(),
+            "all_logs": tail_logs,
+            "all_results": tail_results,
+            "total_results_count": total_results,
+            "total_logs_count": total_logs,
+            "config": {
+                "email_text": job.email_text,
+                "selected_domains": list(job.selected_domain_names),
+                "thread_size": job.thread_size_setting,
+                "proxy": dict(job.proxy_config),
+                "rentry_custom_id": job.rentry_custom_id or "",
+            },
+            "job_start_time": job.job_start_time,
+            "job_end_time": job.job_end_time,
+            "version": APP_VERSION,
+        }
+    emit('full_state', state_data)
+
 def background_status_emitter():
-    """Background task to periodically broadcast state to clients."""
+    """Background task to periodically broadcast state to clients.
+    Caps results/logs per tick to prevent overwhelming the browser.
+    """
     last_log_offset = 0
     last_result_offset = 0
+    MAX_RESULTS_PER_TICK = 50
+    MAX_LOGS_PER_TICK = 30
     while True:
         with job.lock:
             state = job.state
-            done = job.done_emails
+            done = min(job.done_emails, job.total_emails)
             total = job.total_emails
             stats = dict(job.stats)
             rates = job.compute_rates()
-            new_logs = job.logs[last_log_offset:]
-            new_results = job.results[last_result_offset:]
-            last_log_offset = len(job.logs)
-            last_result_offset = len(job.results)
+            # Cap the number of new items per tick to prevent browser flooding
+            all_new_logs = job.logs[last_log_offset:]
+            all_new_results = job.results[last_result_offset:]
+            # Send at most N items per tick; advance offset only by what we send
+            new_logs = all_new_logs[:MAX_LOGS_PER_TICK]
+            new_results = all_new_results[:MAX_RESULTS_PER_TICK]
+            last_log_offset += len(new_logs)
+            last_result_offset += len(new_results)
 
         if state in ("running", "paused") or new_logs or new_results:
             socketio.emit('status_update', {
@@ -818,6 +884,12 @@ def api_start():
     job.proxy_config = proxy_config
     job.rentry_custom_id = rentry_custom_id
     job.state = "running"
+    # --- Store dashboard config for full state restore ---
+    job.email_text = data.get("email_text", "\n".join(valid_emails))
+    job.selected_domain_names = list(domains)
+    job.thread_size_setting = job.thread_size
+    job.job_start_time = time.time()
+    job.job_end_time = None
     dbg("API", f"Job configured — state=running, {len(valid_emails)} emails, batch_size={job.thread_size}")
 
     if invalid_count > 0:
@@ -892,6 +964,46 @@ def api_status():
             "log_offset": len(job.logs),
             "new_results": new_results,
             "result_offset": len(job.results),
+        }
+    return jsonify(data)
+
+
+@app.route("/api/full_state")
+def api_full_state():
+    """Return the COMPLETE state for a reconnecting dashboard.
+    Results and logs are capped to the last N entries to prevent
+    sending megabytes of data that would crash the browser.
+    Total counts are included so the dashboard knows how many exist.
+    """
+    MAX_RESULTS = 200
+    MAX_LOGS = 200
+    with job.lock:
+        total_results = len(job.results)
+        total_logs = len(job.logs)
+        tail_results = job.results[-MAX_RESULTS:] if total_results > MAX_RESULTS else list(job.results)
+        tail_logs = job.logs[-MAX_LOGS:] if total_logs > MAX_LOGS else list(job.logs)
+        data = {
+            "state": job.state,
+            "progress": {
+                "done": min(job.done_emails, job.total_emails),
+                "total": job.total_emails,
+            },
+            "stats": dict(job.stats),
+            "rates": job.compute_rates(),
+            "all_logs": tail_logs,
+            "all_results": tail_results,
+            "total_results_count": total_results,
+            "total_logs_count": total_logs,
+            "config": {
+                "email_text": job.email_text,
+                "selected_domains": list(job.selected_domain_names),
+                "thread_size": job.thread_size_setting,
+                "proxy": dict(job.proxy_config),
+                "rentry_custom_id": job.rentry_custom_id or "",
+            },
+            "job_start_time": job.job_start_time,
+            "job_end_time": job.job_end_time,
+            "version": APP_VERSION,
         }
     return jsonify(data)
 
